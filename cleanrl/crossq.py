@@ -58,6 +58,122 @@ class Args:
     """automatic tuning of the entropy coefficient"""
 
 
+import torch
+
+__all__ = ["BatchRenorm1d", "BatchRenorm"]
+
+
+class BatchRenorm(torch.jit.ScriptModule):
+    """
+    BatchRenorm Module (https://arxiv.org/abs/1702.03275).
+    Adapted to Pytorch from sbx.sbx.common.jax_layers.BatchRenorm
+
+    BatchRenorm is an improved version of vanilla BatchNorm. Contrary to BatchNorm,
+    BatchRenorm uses the running statistics for normalizing the batches after a warmup phase.
+    This makes it less prone to suffer from "outlier" batches that can happen
+    during very long training runs and, therefore, is more robust during long training runs.
+
+    During the warmup phase, it behaves exactly like a BatchNorm layer. After the warmup phase,
+    the running statistics are used for normalization. The running statistics are updated during
+    training mode. During evaluation mode, the running statistics are used for normalization but
+    not updated.
+
+    :param num_features: Number of features in the input tensor.
+    :param eps: A value added to the variance for numerical stability.
+    :param momentum: The value used for the ra_mean and ra_var computation.
+    :param affine: A boolean value that when set to True, this module has learnable
+            affine parameters. Default: True
+    :param warmup_steps: Number of warum steps that are performed before the running statistics
+            are used form normalization. During the warump phase, the batch statistics are used.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 0.001,
+        momentum: float = 0.01,
+        affine: bool = True,
+        warmup_steps: int = 100_000,
+    ):
+        super().__init__()
+        # Running average mean and variance
+        self.register_buffer("ra_mean", torch.zeros(num_features, dtype=torch.float))
+        self.register_buffer("ra_var", torch.ones(num_features, dtype=torch.float))
+        self.register_buffer("steps", torch.tensor(0, dtype=torch.long))
+        self.scale = torch.nn.Parameter(torch.ones(num_features, dtype=torch.float))
+        self.bias = torch.nn.Parameter(torch.zeros(num_features, dtype=torch.float))
+
+        self.affine = affine
+        self.eps = eps
+        self.step = 0
+        self.momentum = momentum
+        self.rmax = 3.0
+        self.dmax = 5.0
+        self.warmup_steps = warmup_steps
+
+    def _check_input_dim(self, x: torch.Tensor) -> None:
+        raise NotImplementedError()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize the input tensor.
+
+        :param x: Input tensor
+        :return: Normalized tensor.
+        """
+
+        if self.training:
+            batch_mean = x.mean(0)
+            batch_var = x.var(0)
+            batch_std = (batch_var + self.eps).sqrt()
+
+            # Use batch statistics during initial warm up phase.
+            # Note: in the original paper, after some warmup phase (batch norm phase of 5k steps)
+            # the constraints are linearly relaxed to r_max/d_max over 40k steps
+            # Here we only have a warmup phase
+            if self.steps > self.warmup_steps:
+
+                running_std = (self.ra_var + self.eps).sqrt()
+                # scale
+                r = (batch_std / running_std).detach()
+                r = r.clamp(1 / self.rmax, self.rmax)
+                # bias
+                d = ((batch_mean - self.ra_mean) / running_std).detach()
+                d = d.clamp(-self.dmax, self.dmax)
+
+                # BatchNorm normalization, using minibatch stats and running average stats
+                # Because we use _normalize, this is equivalent to
+                # ((x - x_mean) / sigma) * r + d = ((x - x_mean) * r + d * sigma) / sigma
+                # where sigma = sqrt(var)
+                custom_mean = batch_mean - d * batch_var.sqrt() / r
+                custom_var = batch_var / (r**2)
+
+            else:
+                custom_mean, custom_var = batch_mean, batch_var
+
+            # Update Running Statistics
+            self.ra_mean += self.momentum * (batch_mean.detach() - self.ra_mean)
+            self.ra_var += self.momentum * (batch_var.detach() - self.ra_var)
+            self.steps += 1
+
+        else:
+            custom_mean, custom_var = self.ra_mean, self.ra_var
+
+        # Normalize
+        x = (x - custom_mean[None]) / (custom_var[None] + self.eps).sqrt()
+
+        if self.affine:
+            x = self.scale * x + self.bias
+
+        return x
+
+
+class BatchRenorm1d(BatchRenorm):
+    def _check_input_dim(self, x: torch.Tensor) -> None:
+        if x.dim() == 1:
+            raise ValueError(f"Expected 2D or 3D input (got {x.dim()}D input)")
+
+
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
@@ -76,26 +192,27 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 class SoftQNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
-        self.bn1 = nn.BatchNorm1d(
-            np.array(env.single_observation_space.shape).prod(),
+        self.bn1 = BatchRenorm1d(
+            np.array(env.single_observation_space.shape).prod()
+            + np.prod(env.single_action_space.shape),
             momentum=0.01,
-            beta=0.001,
+            eps=0.001,
         )
         self.fc1 = nn.Linear(
             np.array(env.single_observation_space.shape).prod()
             + np.prod(env.single_action_space.shape),
             1024,
         )
-        self.bn2 = nn.BatchNorm1d(1024, momentum=0.01, beta=0.001)
+        self.bn2 = BatchRenorm1d(1024, momentum=0.01, eps=0.001)
         self.fc2 = nn.Linear(1024, 1024)
-        self.bn3 = nn.BatchNorm1d(1024, momentum=0.01, beta=0.001)
+        self.bn3 = BatchRenorm1d(1024, momentum=0.01, eps=0.001)
         self.fc3 = nn.Linear(1024, 1)
 
-    def forward(self, x, a, evaluate=False):
-        if evaluate:
-            self.eval()
-        else:
+    def forward(self, x, a, train=False):
+        if train:
             self.train()
+        else:
+            self.eval()
 
         x = torch.cat([x, a], 1)
         x = F.relu(self.fc1(self.bn1(x)))
@@ -111,15 +228,15 @@ LOG_STD_MAX = 2
 class Actor(nn.Module):
     def __init__(self, env):
         super().__init__()
-        self.bn1 = nn.BatchNorm1d(
+        self.bn1 = BatchRenorm1d(
             np.array(env.single_observation_space.shape).prod(),
             momentum=0.01,
-            beta=0.001,
+            eps=0.001,
         )
         self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
-        self.bn2 = nn.BatchNorm1d(256, momentum=0.01, beta=0.001)
+        self.bn2 = BatchRenorm1d(256, momentum=0.01, eps=0.001)
         self.fc2 = nn.Linear(256, 256)
-        self.bn3 = nn.BatchNorm1d(256, momentum=0.01, beta=0.001)
+        self.bn3 = BatchRenorm1d(256, momentum=0.01, eps=0.001)
         self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
         self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
         # action rescaling
@@ -151,11 +268,11 @@ class Actor(nn.Module):
 
         return mean, log_std
 
-    def get_action(self, x, evaluate=False):
-        if evaluate:
-            self.eval()
-        else:
+    def get_action(self, x, train=False):
+        if train:
             self.train()
+        else:
+            self.eval()
         mean, log_std = self(x)
         std = log_std.exp()
         normal = torch.distributions.Normal(mean, std)
@@ -259,9 +376,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 [envs.single_action_space.sample() for _ in range(envs.num_envs)]
             )
         else:
-            actions, _, _ = actor.get_action(
-                torch.Tensor(obs).to(device), evaluate=True
-            )
+            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device), train=False)
             actions = actions.detach().cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
@@ -296,22 +411,29 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             data = rb.sample(args.batch_size)
             with torch.no_grad():
                 next_state_actions, next_state_log_pi, _ = actor.get_action(
-                    data.next_observations
+                    data.next_observations, train=False
                 )
-                # qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                # qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = (
-                    torch.min(qf1_next_target, qf2_next_target)
-                    - alpha * next_state_log_pi
-                )
+
+            cat_obs = torch.cat((data.observations, data.next_observations), dim=0)
+            cat_actions = torch.cat((data.actions, next_state_actions), dim=0)
+
+            qf1_values = qf1(cat_obs, cat_actions, train=True)
+            qf2_values = qf2(cat_obs, cat_actions, train=True)
+
+            qf1_value, qf1_next = torch.split(qf1_values, args.batch_size)
+            qf2_value, qf2_next = torch.split(qf2_values, args.batch_size)
+
+            qf1_value = qf1_value.view(-1)
+            qf2_value = qf2_value.view(-1)
+
+            with torch.no_grad():
+                min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_state_log_pi
                 next_q_value = data.rewards.flatten() + (
                     1 - data.dones.flatten()
-                ) * args.gamma * (min_qf_next_target).view(-1)
+                ) * args.gamma * (min_qf_next).view(-1)
 
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
-            qf2_a_values = qf2(data.observations, data.actions).view(-1)
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+            qf1_loss = F.mse_loss(qf1_value, next_q_value)
+            qf2_loss = F.mse_loss(qf2_value, next_q_value)
             qf_loss = qf1_loss + qf2_loss
 
             # optimize the model
@@ -323,9 +445,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
+                    pi, log_pi, _ = actor.get_action(data.observations, train=True)
+                    qf1_pi = qf1(data.observations, pi, train=False)
+                    qf2_pi = qf2(data.observations, pi, train=False)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
@@ -347,10 +469,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
             if global_step % 100 == 0:
                 writer.add_scalar(
-                    "losses/qf1_values", qf1_a_values.mean().item(), global_step
+                    "losses/qf1_values", qf1_value.mean().item(), global_step
                 )
                 writer.add_scalar(
-                    "losses/qf2_values", qf2_a_values.mean().item(), global_step
+                    "losses/qf2_values", qf2_value.mean().item(), global_step
                 )
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
