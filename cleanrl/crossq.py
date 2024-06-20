@@ -2,7 +2,6 @@ import os
 import random
 import time
 from dataclasses import dataclass
-import time
 
 import gymnasium as gym
 import numpy as np
@@ -35,7 +34,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "HalfCheetah-v4"
+    env_id: str = "Hopper-v4"
     """the environment id of the task"""
     total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
@@ -51,8 +50,6 @@ class Args:
     """the learning rate of the policy network optimizer"""
     q_lr: float = 0.001
     """the learning rate of the Q network network optimizer"""
-    alpha_lr: float = 0.001
-    """the learning rate of the entropy coefficient optimizer"""
     policy_frequency: int = 3
     """the frequency of training policy (delayed)"""
     alpha: float = 0.2
@@ -355,7 +352,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         ).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
-        a_optimizer = optim.Adam([log_alpha], lr=args.alpha_lr)
+        a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
         alpha = args.alpha
 
