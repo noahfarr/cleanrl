@@ -2,6 +2,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
+import time
 
 import gymnasium as gym
 import numpy as np
@@ -34,7 +35,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    env_id: str = "Hopper-v4"
+    env_id: str = "HalfCheetah-v4"
     """the environment id of the task"""
     total_timesteps: int = 1_000_000
     """total timesteps of the experiments"""
@@ -44,12 +45,14 @@ class Args:
     """the discount factor gamma"""
     batch_size: int = 256
     """the batch size of sample from the reply memory"""
-    learning_starts: int = 100
+    learning_starts: int = 5000
     """timestep to start learning"""
     policy_lr: float = 0.001
     """the learning rate of the policy network optimizer"""
     q_lr: float = 0.001
     """the learning rate of the Q network network optimizer"""
+    alpha_lr: float = 0.001
+    """the learning rate of the entropy coefficient optimizer"""
     policy_frequency: int = 3
     """the frequency of training policy (delayed)"""
     alpha: float = 0.2
@@ -265,7 +268,6 @@ class Actor(nn.Module):
         log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (
             log_std + 1
         )  # From SpinUp / Denis Yarats
-
         return mean, log_std
 
     def get_action(self, x, train=False):
@@ -353,7 +355,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         ).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
-        a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
+        a_optimizer = optim.Adam([log_alpha], lr=args.alpha_lr)
     else:
         alpha = args.alpha
 
@@ -427,6 +429,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             qf2_value = qf2_value.view(-1)
 
             with torch.no_grad():
+                qf1_next = qf1_next.detach()
+                qf2_next = qf2_next.detach()
                 min_qf_next = torch.min(qf1_next, qf2_next) - alpha * next_state_log_pi
                 next_q_value = data.rewards.flatten() + (
                     1 - data.dones.flatten()
@@ -446,8 +450,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
                     pi, log_pi, _ = actor.get_action(data.observations, train=True)
+
                     qf1_pi = qf1(data.observations, pi, train=False)
                     qf2_pi = qf2(data.observations, pi, train=False)
+
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
