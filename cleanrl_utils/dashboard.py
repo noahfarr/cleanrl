@@ -68,6 +68,7 @@ class Dashboard:
         monitor.add_row(summary_table, losses_table)
         dashboard.add_row(monitor)
 
+        statistics = Table(box=None, expand=True, pad_edge=False)
         left_stats = Table(box=None, expand=True)
         right_stats = Table(box=None, expand=True)
         left_stats.add_column("Stats", justify="left", width=20, style="yellow")
